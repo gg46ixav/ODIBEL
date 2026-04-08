@@ -4,6 +4,7 @@ import sys
 from dotenv import load_dotenv
 from pyodibel.management.spark_mgr import get_spark_session
 from pyodibel.operations.rdf.rdf2 import rDF2
+from pyspark.sql import functions as F
 
 
 def compute_and_write_stats(input_path: str) -> None:
@@ -12,43 +13,20 @@ def compute_and_write_stats(input_path: str) -> None:
 
     # --- Load data ---
     rdf = rDF2.parse(spark, input_path)
-    df = rdf.df
 
-    def partition_counter(rows):
-        triple_count = 0
-        s_counts = {}
-        p_counts = {}
-        o_counts = {}
+    df = rdf.df.select("s", "p", "o")
 
-        for row in rows:
-            triple_count += 1
+    df = df.persist()
 
-            s = row["s"]
-            p = row["p"]
-            o = row["o"]
+    triple_count_df = df.agg(F.count("*").alias("triple_count"))
 
-            s_counts[s] = s_counts.get(s, 0) + 1
-            p_counts[p] = p_counts.get(p, 0) + 1
-            o_counts[o] = o_counts.get(o, 0) + 1
+    subject_counts_df = df.groupBy("s").count()
+    predicate_counts_df = df.groupBy("p").count()
+    object_counts_df = df.groupBy("o").count()
 
-        yield triple_count, s_counts, p_counts, o_counts
-
-    def reducer(a, b):
-        def merge_dict(d1, d2):
-            for k, v in d2.items():
-                d1[k] = d1.get(k, 0) + v
-            return d1
-
-        return (
-            a[0] + b[0],
-            merge_dict(a[1], b[1]),
-            merge_dict(a[2], b[2]),
-            merge_dict(a[3], b[3]),
-        )
-
-    partial = df.rdd.mapPartitions(partition_counter)
-
-    total_triples, s_counts, p_counts, o_counts = partial.reduce(reducer)
+    subject_counts_df = subject_counts_df.orderBy(F.desc("count"))
+    predicate_counts_df = predicate_counts_df.orderBy(F.desc("count"))
+    object_counts_df = object_counts_df.orderBy(F.desc("count"))
 
     stats_path = os.path.join(os.path.dirname(input_path), "stats")
     triple_count_path = os.path.join(stats_path, "triple_count.csv")
@@ -56,30 +34,13 @@ def compute_and_write_stats(input_path: str) -> None:
     predicate_counts_path = os.path.join(stats_path, "predicate_counts.csv")
     object_counts_path = os.path.join(stats_path, "object_counts.csv")
 
-    triple_df = spark.createDataFrame(
-        [(total_triples,)], ["triple_count"]
-    )
+    triple_count_df.coalesce(1).write.mode("overwrite").csv(triple_count_path, header=True)
 
-    subject_df = spark.createDataFrame(
-        [(k, v) for k, v in s_counts.items()],
-        ["s", "count"]
-    )
+    subject_counts_df.write.mode("overwrite").option("compression", "gzip").csv(subject_count_path, header=True)
+    predicate_counts_df.write.mode("overwrite").option("compression", "gzip").csv(predicate_counts_path, header=True)
+    object_counts_df.write.mode("overwrite").option("compression", "gzip").csv(object_counts_path, header=True)
 
-    predicate_df = spark.createDataFrame(
-        [(k, v) for k, v in p_counts.items()],
-        ["p", "count"]
-    )
-
-    object_df = spark.createDataFrame(
-        [(k, v) for k, v in o_counts.items()],
-        ["o", "count"]
-    )
-
-    triple_df.coalesce(1).write.mode("overwrite").csv(triple_count_path, header=True)
-
-    subject_df.write.mode("overwrite").csv(subject_count_path, header=True)
-    predicate_df.write.mode("overwrite").csv(predicate_counts_path, header=True)
-    object_df.write.mode("overwrite").csv(object_counts_path, header=True)
+    df.unpersist()
 
     spark.stop()
 
